@@ -538,6 +538,94 @@ The initial increase in QPS and TPS is substantial as threads increase from 8 to
 
 While higher thread counts improve throughput (QPS/TPS), they also result in increased latencies, which can affect user experience. This highlights the importance of finding an optimal thread count for balancing throughput and latency.
 
+**Reason analysis**:
+
+First consider using the `perf` and `flamegraph` 
+
+```cmd
+# download the flamegraph tools
+git clone https://github.com/brendangregg/FlameGraph.git
+# perf record, 512 threads
+perf record -aa -g -F99 sysbench --config-file=test.cfg oltp_point_select --tables=64 --table-size=10000000 --threads=512 run
+# generate report
+perf script | FlameGraph-master/stackcollapse-perf.pl | FlameGraph-master/flamegraph.pl > perf.svg
+```
+
+The `perf.svg` , we can see that there are a lot of `unknown` operations, it's hard to analyze, need another way
+
+![perf-result](./images/perf-result.jpeg)
+
+In order to locate the general reason why performance dropped after 128 threads, first try to get an insight into the hardware performance
+
+Run `top` while running the benchmark with 128 threads
+
+![top-128](./images/top-128.png)
+
+256 threads
+
+![top-256](./images/top-256.png)
+
+It can be seen that CPU usage didn't increase with more threads, I then ran the benchmark with 64 threads and 512 threads separately, finding that CPU usage **reaches the highest point** with 128 threads and didn't keep on increasing with more threads.
+
+I also check the disk status using `dstat -d` command
+
+128 threads:
+
+![dstat-128](./images/dstat-128.png)
+
+256 threads:
+
+![dstat-256](./images/dstat-256.png)
+
+512 threads:
+
+![dstat-512](./images/dstat-512.png)
+
+ The command shows the read and write capacity of disk per second. (E.x. read 558 MB from disk every second)
+
+Apparently, the **read capacity significantly dropped** when the threads increase. It can be concluded that part of the reason why performance dropped can be due to the disk.
+
+Then I analyze the performance of the disk, first use the `iostat -x 1`, this is meant to monitor the I/O queue of the disk
+
+128 threads:
+
+![iostat-128](./images/iostat-128.png)
+
+512 threads:
+
+![iostat-512](./images/iostat-512.png)
+
+It can be seen that both test utilized 100% disk nvme0n1. However, the Average Queue Size(avgqu-sz) of the 128 thread test is larger than the 512 threads one.
+
+Use the `vmstat 1` to check context switch number, check the `cs` column
+
+128 threads:
+
+![vmstat-128](./images/vmstat-128.png)
+
+512 threads:
+
+![vmstat-512](./images/vmstat-512.png)
+
+There are more context switch using 128 threads.
+
+Analysis:
+
+1. Context Switch
+    When the number of threads increases, if the thread scheduler cannot effectively manage so many threads, it may cause some threads to be blocked for a long time or not get enough CPU time. In other words, the operating system's scheduler may have a large number of threads, and the priority scheduling mechanism will cause some threads to starve, and the actual context switch will be performed less often.
+    Alternatively, it may be that MySQL thread pools or other kernel-level scheduling optimization policies reduce voluntary context switching in high-thread situations.
+2. CPU utilization
+    Reasons for the same CPU utilization:
+    The same CPU utilization may be due to the fact that the CPU has reached the bottleneck in both 128and 512 threads cases. Even if the number of threads increases, the CPU utilization is saturated and cannot be further improved. Thus, CPU usage does not increase significantly even with more threads.
+    Another possible reason is that with a high number of threads, the CPU time is spread among more threads, reducing the CPU time obtained by a single thread.
+3. Disk read and write performance
+    The disk reads less data per second with 512 threads than 128threads:
+    Disk I/O is a finite resource and contention increases when the number of threads increases. If some threads occupy a large amount of I/O resources, it may cause other threads to wait for I/O, and the overall read and write performance will degrade. Therefore, more threads do not necessarily mean more data transfers, but may lead to an overall performance degradation.
+    Bottlenecks in disk I/O may be caused by the lack of centralization of disk read operations due to I/O requests being more spread out at higher thread counts.
+4. Average Queue Size (avgqu-sz)
+    avgqu-sz denotes the average length of the I/O queue. If the queue size is larger at 128threads, this may mean that I/O requests are concentrated and the disk device is busy processing these requests, causing requests to queue.
+    At 512 threads, more I/O requests are spread out, leading to a reduction in the queue length on a single device. Even if the overall I/O requests increase, because too many threads compete for resources, I/O requests are instead delayed or optimized by the kernel scheduling mechanism, making avgqu-sz smaller.
+
 #### Write only benchmark
 
 Create database `systest_wo`:
@@ -552,3 +640,37 @@ Prepare data:
 sysbench --config-file=write-only-64.cfg oltp_write_only --tables=64 --table-size=10000000 prepare
 ```
 
+
+
+#### Read only benchmark
+
+Create database `systest_ro`:
+
+```cmd
+mysql> create database systestrwo;
+```
+
+Prepare data:
+
+```cmd
+sysbench --config-file=read-only-64.cfg oltp_read_only --tables=64 --table-size=10000000 prepare
+```
+
+Test result:
+
+| Threads | QPS       | TPS      | 95% Latency (ms) | Minimum Latency | Average Latency | Maximum Latency | Total Latency Sum |
+| ------- | --------- | -------- | ---------------- | --------------- | --------------- | --------------- | ----------------- |
+| 16      | 198932.22 | 12433.10 | 1.86             | 1.86            | 1.86            | 1.86            | 11.16             |
+| 32      | 241508.90 | 15093.98 | 3.25             | 3.19            | 3.24            | 3.25            | 19.44             |
+| 64      | 232253.35 | 14515.24 | 6.79             | 6.79            | 6.83            | 7.04            | 40.99             |
+| 128     | 205049.39 | 12814.40 | 16.71            | 16.41           | 16.76           | 17.63           | 100.58            |
+| 256     | 161984.06 | 10121.83 | 44.98            | 44.98           | 45.66           | 47.47           | 273.99            |
+| 512     | 176424.42 | 11022.08 | 196.89           | 193.38          | 195.15          | 200.47          | 1170.88           |
+
+![read_only](./images/read_only.png)
+
+As the number of threads increases from 16 to 256, the Queries Per Second (QPS) initially increases, reaching a peak of 241,508.90 with 32 threads, then decreases to 161,984.06 with 256 threads.
+
+The Transactions Per Second (TPS) also shows a similar trend, peaking at 15,093.98 with 32 threads before declining to 10,121.83 with 256 threads. This suggests that there may be an optimal number of threads for maximizing throughput, likely around 32 threads in this case.
+
+**95% Latency**: This metric shows a substantial increase as the number of threads increases. It starts at 1.86 ms with 16 threads and rises to 196.89 ms with 512 threads. This indicates that the response time for the majority of requests becomes significantly worse as the thread count increases, likely due to contention and resource limitations.
